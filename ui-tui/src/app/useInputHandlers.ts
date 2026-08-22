@@ -35,6 +35,8 @@ const DASHBOARD_NEW_SESSION_MESSAGE = 'starting a fresh dashboard chat...'
 
 export const shouldAllowIdleHotkeyExit = (dashboardTuiMode = DASHBOARD_TUI_MODE) => !dashboardTuiMode
 
+export const shouldSuppressDashboardIdleCtrlC = (dashboardTuiMode = DASHBOARD_TUI_MODE) => dashboardTuiMode
+
 export function handleIdleHotkeyExit(
   actions: Pick<InputHandlerActions, 'die' | 'sys'>,
   dashboardTuiMode = DASHBOARD_TUI_MODE,
@@ -569,7 +571,13 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       }
 
       // On macOS, Cmd+C with no selection is a no-op (Ctrl+C below handles interrupt).
-      // On non-macOS, isAction uses Ctrl, so fall through to interrupt/clear/exit.
+      // Dashboard mode must also consume Ctrl+C with no selection because the
+      // browser/xterm layer may be bypassed by an older bundle or a direct PTY
+      // path. Direct non-Mac TUI keeps its normal interrupt semantics.
+      if (shouldSuppressDashboardIdleCtrlC()) {
+        return
+      }
+
       if (isMac) {
         return
       }

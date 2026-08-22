@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { copyTextToClipboard } from "./clipboard";
+import {
+  copyTextToClipboard,
+  isDashboardCopyShortcut,
+  isDashboardPasteShortcut,
+} from "./clipboard";
 
 const originalNavigator = globalThis.navigator;
 const originalDocument = globalThis.document;
@@ -20,6 +24,27 @@ afterEach(() => {
   setGlobal("document", originalDocument);
   setGlobal("window", originalWindow);
   vi.restoreAllMocks();
+});
+
+describe("dashboard clipboard shortcuts", () => {
+  it("treats bare Ctrl+C and Ctrl+V as shortcuts on non-Mac platforms", () => {
+    expect(isDashboardCopyShortcut("c", true, false, false)).toBe(true);
+    expect(isDashboardPasteShortcut("v", true, false, false)).toBe(true);
+    expect(isDashboardCopyShortcut("c", false, false, false)).toBe(false);
+    expect(isDashboardPasteShortcut("v", false, false, false)).toBe(false);
+  });
+
+  it("uses Cmd+C and Cmd+V on macOS", () => {
+    expect(isDashboardCopyShortcut("c", false, true, true)).toBe(true);
+    expect(isDashboardPasteShortcut("v", false, true, true)).toBe(true);
+    expect(isDashboardCopyShortcut("c", true, false, true)).toBe(false);
+    expect(isDashboardPasteShortcut("v", true, false, true)).toBe(false);
+  });
+
+  it("does not claim unmodified characters", () => {
+    expect(isDashboardCopyShortcut("c", false, false, false)).toBe(false);
+    expect(isDashboardPasteShortcut("v", false, false, false)).toBe(false);
+  });
 });
 
 describe("copyTextToClipboard", () => {

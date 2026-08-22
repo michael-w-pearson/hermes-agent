@@ -1,3 +1,21 @@
+export function isDashboardCopyShortcut(
+  key: string,
+  ctrlKey: boolean,
+  metaKey: boolean,
+  mac: boolean,
+): boolean {
+  return key.toLowerCase() === "c" && (mac ? metaKey : ctrlKey);
+}
+
+export function isDashboardPasteShortcut(
+  key: string,
+  ctrlKey: boolean,
+  metaKey: boolean,
+  mac: boolean,
+): boolean {
+  return key.toLowerCase() === "v" && (mac ? metaKey : ctrlKey);
+}
+
 export async function copyTextToClipboard(text: string): Promise<boolean> {
   const clipboard =
     typeof navigator === "undefined" ? undefined : navigator.clipboard;

@@ -6,7 +6,8 @@ import {
   dismissSensitivePrompt,
   handleIdleHotkeyExit,
   shouldAllowIdleHotkeyExit,
-  shouldFallThroughForScroll
+  shouldFallThroughForScroll,
+  shouldSuppressDashboardIdleCtrlC
 } from '../app/useInputHandlers.js'
 
 const baseKey = {
@@ -56,6 +57,16 @@ describe('shouldAllowIdleHotkeyExit', () => {
 
   it('disables idle exit hotkeys in dashboard chat', () => {
     expect(shouldAllowIdleHotkeyExit(true)).toBe(false)
+  })
+})
+
+describe('shouldSuppressDashboardIdleCtrlC', () => {
+  it('suppresses Ctrl+C in dashboard mode', () => {
+    expect(shouldSuppressDashboardIdleCtrlC(true)).toBe(true)
+  })
+
+  it('preserves Ctrl+C in direct TUI mode', () => {
+    expect(shouldSuppressDashboardIdleCtrlC(false)).toBe(false)
   })
 })
 

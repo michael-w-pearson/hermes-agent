@@ -35,6 +35,11 @@ import { ChatSessionList } from "@/components/ChatSessionList";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
 import { api } from "@/lib/api";
+import {
+  copyTextToClipboard,
+  isDashboardCopyShortcut,
+  isDashboardPasteShortcut,
+} from "@/lib/clipboard";
 import { latchChatActivation } from "@/lib/chat-activation";
 import { normalizeSessionTitle } from "@/lib/chat-title";
 import { PtyResumeSanitizer } from "@/lib/pty-resume-sanitizer";
@@ -523,27 +528,19 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     //
     // Four independent paths all route to the system clipboard:
     //
-    //   1. **Selection → Ctrl+C (or Cmd+C on macOS).**  Ink's own handler
-    //      in useInputHandlers.ts turns Ctrl+C into a copy when the
-    //      terminal has a selection, then emits an OSC 52 escape.  Our
-    //      OSC 52 handler below decodes that escape and writes to the
-    //      browser clipboard — so the flow works just like it does in
-    //      `hermes --tui`.
+    //   1. **Selection → Ctrl+C (or Cmd+C on macOS).**  The browser handler
+    //      below owns the shortcut and writes xterm's selection directly to
+    //      the browser clipboard, so it can never become a PTY SIGINT.
     //
-    //   2. **Ctrl/Cmd+Shift+C.**  Belt-and-suspenders shortcut that
-    //      operates directly on xterm's selection, useful if the TUI
-    //      ever stops listening (e.g. overlays / pickers) or if the user
-    //      has selected with the mouse outside of Ink's selection model.
+    //   2. **Ctrl/Cmd+Shift+C.**  Shift remains accepted as a terminal muscle
+    //      memory variant because the shortcut predicate accepts it.
     //
-    //   3. **Ctrl/Cmd+Shift+V.**  Prefers clipboard.read() for images
-    //      (upload → `/image`), else readText() into term.paste().
-    //      preventDefault here suppresses the DOM paste event, so image
-    //      handling must live in this key path — not only the host
-    //      listener below.
+    //   3. **Ctrl/Cmd+V.**  Prefers clipboard.read() for images (upload →
+    //      `/image`), else readText() into term.paste().
     //
-    //   4. **DOM paste / drop on the host.**  Bare Ctrl+V and context-menu
-    //      paste fire a ClipboardEvent; drag-drop lands files. Image
-    //      payloads upload to HERMES_HOME/images then drive `/image`.
+    //   4. **DOM paste / drop on the host.**  Context-menu paste fires a
+    //      ClipboardEvent; drag-drop lands files. Image payloads upload to
+    //      HERMES_HOME/images then drive `/image`.
     //
     // OSC 52 reads (terminal asking to read the clipboard) are not
     // supported — that would let any content the TUI renders exfiltrate
@@ -643,34 +640,43 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     term.attachCustomKeyEventHandler((ev) => {
       if (ev.type !== "keydown") return true;
 
-      // Copy: Cmd+C on macOS, Ctrl+Shift+C on other platforms. Bare Ctrl+C
-      // is reserved for SIGINT to the TUI child — matches xterm / gnome-terminal /
-      // konsole / Windows Terminal. Ctrl+Shift+C only copies if a selection exists;
-      // without a selection it passes through to the TUI so agents can still
-      // react to the keypress.
-      // Paste: Cmd+Shift+V on macOS, Ctrl+Shift+V on others.
-      const copyModifier = isMac ? ev.metaKey : ev.ctrlKey && ev.shiftKey;
-      const pasteModifier = isMac ? ev.metaKey : ev.ctrlKey && ev.shiftKey;
+      // Dashboard/browser clipboard contract: Ctrl+C/Ctrl+V on Windows/Linux,
+      // Cmd+C/Cmd+V on macOS. Bare Ctrl+C must never reach the PTY here:
+      // xterm would encode it as SIGINT, and the dashboard TUI interprets an
+      // idle Ctrl+C as a request to start a fresh session.
+      const copyShortcut = isDashboardCopyShortcut(
+        ev.key,
+        ev.ctrlKey,
+        ev.metaKey,
+        isMac,
+      );
+      const pasteShortcut = isDashboardPasteShortcut(
+        ev.key,
+        ev.ctrlKey,
+        ev.metaKey,
+        isMac,
+      );
 
-      if (copyModifier && ev.key.toLowerCase() === "c") {
+      if (copyShortcut) {
         const sel = term.getSelection();
         if (sel) {
-          // Direct writeText inside the keydown handler preserves the user
-          // gesture — async round-trips through OSC 52 can lose activation
-          // and fail with "Document is not focused".
-          navigator.clipboard.writeText(sel).catch((err) => {
-            console.warn("[dashboard clipboard] direct copy failed:", err.message);
+          // Keep the copy attempt inside the keydown gesture. The helper also
+          // provides the selection-based fallback for insecure contexts.
+          void copyTextToClipboard(sel).then((copied) => {
+            if (!copied) {
+              console.warn("[dashboard clipboard] direct copy failed");
+            }
           });
-          // Clear xterm.js's highlight after copy (matches gnome-terminal).
           term.clearSelection();
-          ev.preventDefault();
-          return false;
         }
-        // No selection → fall through so the TUI receives Ctrl+Shift+C
-        // (or the bare ev if the user used a different modifier).
+
+        // With or without a selection, consume the shortcut so it cannot
+        // become a destructive PTY control character.
+        ev.preventDefault();
+        return false;
       }
 
-      if (pasteModifier && ev.key.toLowerCase() === "v") {
+      if (pasteShortcut) {
         // preventDefault suppresses the DOM paste event, so image paste must
         // be handled here via clipboard.read() — readText() alone misses
         // image-only clipboards (the Discord / #24860 failure mode).
