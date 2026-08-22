@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent.session_activity import ActivityProvenance, build_activity_snapshot
+from gateway.config import Platform
 from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL
 from gateway.session_stall import (
     format_session_stall_notification,
@@ -166,6 +167,47 @@ def _runner_for_stall(adapter: _FakeAdapter) -> GatewayRunner:
 def _pending_event(chat_id: str = "chat-1", thread_id: str | None = None):
     source = SimpleNamespace(chat_id=chat_id, thread_id=thread_id, platform=None)
     return SimpleNamespace(text="follow-up", source=source, timestamp=time.time())
+
+
+def test_session_stall_target_routes_telegram_to_error_lane():
+    adapter = _FakeAdapter()
+    runner = _runner_for_stall(adapter)
+    runner._read_user_config = lambda: {
+        "cron": {"error_delivery_target": "telegram:1221479515:36948"}
+    }
+    runner._thread_metadata_for_target = lambda platform, chat, thread, **kwargs: {
+        "thread_id": thread,
+        "direct_messages_topic_id": thread,
+    }
+    source = SimpleNamespace(
+        chat_id="1221479515",
+        thread_id="26643",
+        platform=Platform.TELEGRAM,
+    )
+
+    chat_id, metadata = runner._session_stall_notification_target(source, adapter)
+
+    assert chat_id == "1221479515"
+    assert metadata["thread_id"] == "36948"
+    assert metadata["direct_messages_topic_id"] == "36948"
+
+
+def test_session_stall_target_preserves_origin_without_valid_error_lane():
+    adapter = _FakeAdapter()
+    runner = _runner_for_stall(adapter)
+    runner._read_user_config = lambda: {
+        "cron": {"error_delivery_target": "telegram"}
+    }
+    source = SimpleNamespace(
+        chat_id="1221479515",
+        thread_id="26643",
+        platform=Platform.TELEGRAM,
+    )
+
+    chat_id, metadata = runner._session_stall_notification_target(source, adapter)
+
+    assert chat_id == "1221479515"
+    assert metadata["thread_id"] == "26643"
 
 
 @pytest.mark.asyncio

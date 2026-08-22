@@ -6876,7 +6876,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self,
         source: SessionSource,
     ) -> Optional[str]:
-        """Pin DM-topic routing to the user's last-active topic.
+        """Normalize configured reserved DM lanes, then recover lobby replies.
+
+        An operator may reserve Telegram DM topics for reports/diagnostics while
+        designating one topic as the normal conversation lane.  Human inbound
+        messages in that configured chat must be normalized to the conversation
+        lane *here*, before the adapter derives its session key or captures
+        outbound thread metadata.  A later plugin rewrite is too late for those
+        call paths and can log success while the reply still lands in the raw
+        inbound topic.
 
         Telegram can omit ``message_thread_id`` or surface General (``1``)
         for some topic-mode DM replies. In those lobby-shaped cases, keep the
@@ -6896,6 +6904,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ):
             return None
         inbound = str(source.thread_id or "")
+
+        # Reserved-lane policy is deliberately opt-in and scoped to a chat that
+        # also appears in ``dm_topics``.  Missing or malformed policy preserves
+        # upstream topic behaviour rather than guessing a destination.
+        platform_config = (getattr(self, "config", None) and self.config.platforms.get(Platform.TELEGRAM))
+        extra = getattr(platform_config, "extra", None) or {}
+        policy = extra.get("dm_topic_policy")
+        if isinstance(policy, dict):
+            conversation_id = str(policy.get("default_conversation_thread_id") or "")
+            configured_chat = False
+            configured_topic_ids: set[str] = set()
+            dm_topics = extra.get("dm_topics") or []
+            if isinstance(dm_topics, list):
+                for entry in dm_topics:
+                    if not isinstance(entry, dict) or str(entry.get("chat_id") or "") != str(source.chat_id):
+                        continue
+                    configured_chat = True
+                    for topic in entry.get("topics") or []:
+                        if isinstance(topic, dict) and topic.get("thread_id") is not None:
+                            configured_topic_ids.add(str(topic["thread_id"]))
+                    break
+            if (
+                configured_chat
+                and conversation_id
+                and conversation_id in configured_topic_ids
+                and inbound != conversation_id
+            ):
+                return conversation_id
+
         is_lobby = not inbound or inbound in self._TELEGRAM_GENERAL_TOPIC_IDS
         if not is_lobby:
             # A non-lobby, unknown thread_id is most likely the first message in
@@ -12316,6 +12353,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None
         return summary if isinstance(summary, dict) else None
 
+    def _session_stall_notification_target(self, source, adapter):
+        """Route Telegram stall diagnostics to the configured error lane.
+
+        ``cron.error_delivery_target`` is the existing operator-owned diagnostics
+        target. Reusing it keeps cron failures and gateway stall notices on one
+        Noticeboard without changing non-Telegram or unconfigured deployments.
+        """
+        chat_id = getattr(source, "chat_id", None) if source is not None else None
+        metadata = (
+            self._thread_metadata_for_source(source)
+            if source is not None and hasattr(self, "_thread_metadata_for_source")
+            else None
+        )
+        if getattr(source, "platform", None) != Platform.TELEGRAM:
+            return chat_id, metadata
+
+        config = self._read_user_config()
+        target = str(
+            ((config.get("cron") or {}).get("error_delivery_target") or "")
+        ).strip()
+        parts = target.split(":", 2)
+        if len(parts) != 3 or parts[0] != "telegram" or not parts[1] or not parts[2]:
+            return chat_id, metadata
+
+        target_chat_id, target_thread_id = parts[1], parts[2]
+        target_metadata = self._thread_metadata_for_target(
+            Platform.TELEGRAM,
+            target_chat_id,
+            target_thread_id,
+            chat_type="dm",
+            adapter=adapter,
+        )
+        return target_chat_id, target_metadata
+
     async def _check_session_stalls(self, timeout_seconds: float) -> int:
         """Scan pending inbound sessions and notify once per stall episode.
 
@@ -12404,7 +12475,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 or "unknown",
             )
             source = getattr(pending_event, "source", None)
-            chat_id = getattr(source, "chat_id", None) if source is not None else None
+            chat_id, metadata = self._session_stall_notification_target(source, adapter)
             if not chat_id:
                 logger.warning(
                     "Session stall notify skipped (no chat_id): session=%s",
@@ -12449,11 +12520,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 notified_map.pop(session_key, None)
                 continue
             try:
-                metadata = (
-                    self._thread_metadata_for_source(source)
-                    if source is not None and hasattr(self, "_thread_metadata_for_source")
-                    else None
-                )
                 # Round-2 #2: bound the send. A wedged adapter transport
                 # (network hang, dead websocket) must not block the whole
                 # watcher pass — sibling candidates in this loop would never
@@ -14619,25 +14685,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
                 _hook_results = []
 
-            for _result in _hook_results:
-                if not isinstance(_result, dict):
-                    continue
-                _action = _result.get("action")
-                if _action == "skip":
+            # HERMES_LOCAL_PATCH: pre_gateway_dispatch_skip_priority
+            # Evaluate every hook result before deciding flow control. A later
+            # interceptor must be able to veto an earlier routing rewrite.
+            _dict_results = [r for r in _hook_results if isinstance(r, dict)]
+            for _result in _dict_results:
+                if _result.get("action") == "skip":
+                    _platform = (
+                        getattr(source.platform, "value", source.platform)
+                        if source.platform else "unknown"
+                    )
                     logger.info(
                         "pre_gateway_dispatch skip: reason=%s platform=%s chat=%s",
                         _result.get("reason"),
-                        source.platform.value if source.platform else "unknown",
+                        _platform,
                         source.chat_id or "unknown",
                     )
                     return None
-                if _action == "rewrite":
+            for _result in _dict_results:
+                if _result.get("action") == "rewrite":
                     _new_text = _result.get("text")
                     if isinstance(_new_text, str):
                         event = dataclasses.replace(event, text=_new_text)
                         source = event.source
                     break
-                if _action == "allow":
+                if _result.get("action") == "allow":
                     break
 
         if is_internal:
