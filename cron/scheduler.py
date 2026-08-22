@@ -342,6 +342,43 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     return f"⚠️ Cron '{job_name}' failed: {cleaned}"
 
 
+FAILURE_LANE_CONFIG_ERROR = (
+    "cron failure-delivery target configuration unavailable; delivery blocked"
+)
+
+
+class CronFailureDeliveryConfigError(RuntimeError):
+    """The failure-delivery lane could not be resolved safely."""
+
+
+def _job_for_cron_delivery(job: dict, *, success: bool) -> dict:
+    """Return the effective delivery job without mutating the stored job.
+
+    Successful output keeps its configured destination. Failed output may be
+    redirected to ``cron.error_delivery_target``. If configuration cannot be
+    read, fail closed rather than leaking a failure into the job's ordinary
+    success destination.
+    """
+    if success:
+        return job
+    try:
+        cfg = load_config() or {}
+        target = str(
+            ((cfg.get("cron") or {}).get("error_delivery_target") or "")
+        ).strip()
+    except Exception:
+        logger.error(
+            "Cron failure-delivery target lookup failed; refusing fallback "
+            "delivery; details redacted"
+        )
+        raise CronFailureDeliveryConfigError(FAILURE_LANE_CONFIG_ERROR) from None
+    if not target:
+        return job
+    routed = dict(job)
+    routed["deliver"] = target
+    return routed
+
+
 class CronPromptInjectionBlocked(Exception):
     """Raised by _build_job_prompt when the fully-assembled prompt trips the
     injection scanner. Caught in run_job so the operator sees a clean
@@ -6895,6 +6932,7 @@ def _run_one_job_body(
                         f"⚠️ Cron '{job.get('name') or job['id']}' skipped: "
                         f"{_drift_text}"
                     )
+            delivery_job = _job_for_cron_delivery(job, success=success)
             # Treat whitespace-only final responses the same as empty
             # responses: do not deliver a blank message, and let the
             # empty-response guard below mark the run as a soft failure.
@@ -6921,8 +6959,10 @@ def _run_one_job_body(
 
             if should_deliver:
                 unresolved_origin = (
-                    _normalize_deliver_value(job.get("deliver", "local")) == "origin"
-                    and not _resolve_delivery_targets(job)
+                    _normalize_deliver_value(
+                        delivery_job.get("deliver", "local")
+                    ) == "origin"
+                    and not _resolve_delivery_targets(delivery_job)
                 )
                 try:
                     with _side_effect_fence() as owns_delivery:
@@ -6930,7 +6970,7 @@ def _run_one_job_body(
                             raise _FireClaimLostDuringSideEffect
                         delivery_attempted = True
                         delivery_error = _deliver_result(
-                            job,
+                            delivery_job,
                             deliver_content,
                             adapters=adapters,
                             loop=loop,
@@ -7021,7 +7061,9 @@ def _run_one_job_body(
                 error="Fire claim ownership lost before terminal completion.",
             )
             return True
-        normalized_deliver = _normalize_deliver_value(job.get("deliver", "local"))
+        normalized_deliver = _normalize_deliver_value(
+            delivery_job.get("deliver", "local")
+        )
         if delivery_error:
             delivery_outcome = "failed"
         elif should_deliver and unresolved_origin:
@@ -7056,20 +7098,24 @@ def _run_one_job_body(
         # transport-cancelled worker) must not send a failure alert on top of
         # the replacement run's own delivery — fall through silently and let
         # the fenced bookkeeping below decide what (if anything) to record.
-        if (
+        if isinstance(e, CronFailureDeliveryConfigError):
+            delivery_error = FAILURE_LANE_CONFIG_ERROR
+            delivery_outcome = "failed"
+        elif (
             isinstance(e, Exception)
             and not delivery_attempted
             and not isinstance(e, _FireClaimLostDuringSideEffect)
             and not _fire_claim_ownership_lost()
         ):
-            normalized_deliver = _normalize_deliver_value(
-                job.get("deliver", "local")
-            )
             unresolved_origin = False
             try:
+                delivery_job = _job_for_cron_delivery(job, success=False)
+                normalized_deliver = _normalize_deliver_value(
+                    delivery_job.get("deliver", "local")
+                )
                 delivery_attempted = True
                 delivery_error = _deliver_result(
-                    job,
+                    delivery_job,
                     # Composed exactly like the normal failure delivery above.
                     # mark_job_run below records THIS run in failure_streak
                     # whichever layer failed, so a job that fails before the
@@ -7087,7 +7133,7 @@ def _run_one_job_body(
                     "Delivery failed for job %s: %s", job["id"], delivery_exc
                 )
             if not delivery_error and normalized_deliver == "origin":
-                unresolved_origin = not _resolve_delivery_targets(job)
+                unresolved_origin = not _resolve_delivery_targets(delivery_job)
             if delivery_error:
                 delivery_outcome = "failed"
             elif unresolved_origin:
