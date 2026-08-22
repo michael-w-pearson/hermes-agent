@@ -151,6 +151,48 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     return f"⚠️ Cron '{job_name}' failed: {cleaned}"
 
 
+FAILURE_LANE_CONFIG_ERROR = (
+    "cron failure-delivery target configuration unavailable; delivery blocked"
+)
+FAILURE_DELIVERY_OUTCOME_UNKNOWN = (
+    "cron failure delivery was attempted; outcome unknown; retry blocked"
+)
+
+
+class CronFailureDeliveryConfigError(RuntimeError):
+    """The error lane cannot be resolved safely from configuration."""
+
+
+def _job_for_cron_delivery(job: dict, *, success: bool) -> dict:
+    """Return the effective delivery job for this run.
+
+    Successful output keeps the job's configured destination. Failed runs may
+    be redirected to a dedicated operator lane via
+    ``cron.error_delivery_target``. The stored job is never mutated, so the
+    next successful report still goes to its normal destination.
+
+    HERMES_LOCAL_PATCH: cron_failure_delivery_lane
+    """
+    if success:
+        return job
+    try:
+        cfg = load_config() or {}
+        target = str((cfg.get("cron") or {}).get("error_delivery_target") or "").strip()
+    except Exception:
+        # Never leak config/parser details and never fall back to the job's
+        # ordinary success chat when the dedicated operator lane is unknown.
+        logger.error(
+            "Cron failure-delivery target lookup failed; refusing fallback "
+            "delivery; details redacted"
+        )
+        raise CronFailureDeliveryConfigError(FAILURE_LANE_CONFIG_ERROR) from None
+    if not target:
+        return job
+    routed = dict(job)
+    routed["deliver"] = target
+    return routed
+
+
 class CronPromptInjectionBlocked(Exception):
     """Raised by _build_job_prompt when the fully-assembled prompt trips the
     injection scanner. Caught in run_job so the operator sees a clean
@@ -4499,6 +4541,8 @@ def run_one_job(
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct")["id"]
+    failure_delivery_attempted = False
+    failure_delivery_outcome = "not_attempted"
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
@@ -4623,6 +4667,7 @@ def run_one_job(
                 )
             else:
                 deliver_content = final_response if success else _summarize_cron_failure_for_delivery(job, error)
+            delivery_job = _job_for_cron_delivery(job, success=success)
             # Treat whitespace-only final responses the same as empty
             # responses: do not deliver a blank message, and let the
             # empty-response guard below mark the run as a soft failure.
@@ -4642,11 +4687,25 @@ def run_one_job(
 
             if should_deliver:
                 unresolved_origin = (
-                    _normalize_deliver_value(job.get("deliver", "local")) == "origin"
-                    and not _resolve_delivery_targets(job)
+                    _normalize_deliver_value(delivery_job.get("deliver", "local")) == "origin"
+                    and not _resolve_delivery_targets(delivery_job)
                 )
                 try:
-                    delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                    if not success and _normalize_deliver_value(
+                        delivery_job.get("deliver", "local")
+                    ) != "local":
+                        failure_delivery_attempted = True
+                        failure_delivery_outcome = "attempted"
+                    delivery_error = _deliver_result(
+                        delivery_job,
+                        deliver_content,
+                        adapters=adapters,
+                        loop=loop,
+                    )
+                    if failure_delivery_attempted:
+                        failure_delivery_outcome = (
+                            "failed" if delivery_error else "delivered"
+                        )
                 except Exception as de:
                     delivery_error = str(de)
                     logger.error("Delivery failed for job %s: %s", job["id"], de)
@@ -4672,8 +4731,12 @@ def run_one_job(
                 )
             else:
                 mark_job_run(job["id"], success, error, delivery_error=delivery_error)
-        normalized_deliver = _normalize_deliver_value(job.get("deliver", "local"))
-        if delivery_error:
+        normalized_deliver = _normalize_deliver_value(delivery_job.get("deliver", "local"))
+        if not success and failure_delivery_attempted:
+            delivery_outcome = (
+                "failed" if delivery_error else failure_delivery_outcome
+            )
+        elif delivery_error:
             delivery_outcome = "failed"
         elif should_deliver and unresolved_origin:
             delivery_outcome = "not_configured"
@@ -4701,9 +4764,71 @@ def run_one_job(
         # anything that isn't a plain Exception.
         _err_text = str(e) or type(e).__name__
         logger.error("Error processing job %s: %s", job['id'], _err_text)
+        delivery_error = None
+        delivery_outcome = "suppressed"
+        delivery_interrupt = None
+        if isinstance(e, CronFailureDeliveryConfigError):
+            # The helper already emitted a fixed redacted log. Do not retry the
+            # config read and never fall back to the ordinary job destination.
+            delivery_error = FAILURE_LANE_CONFIG_ERROR
+            delivery_outcome = "failed"
+        elif failure_delivery_attempted:
+            # _deliver_result may have completed the external send before a
+            # BaseException interrupted its caller. Exactly-once wins over an
+            # unsafe retry: record an unknown outcome and refuse a second send.
+            delivery_error = FAILURE_DELIVERY_OUTCOME_UNKNOWN
+            delivery_outcome = "failed"
+            logger.error(
+                "Failure delivery for job %s was interrupted after an attempt; "
+                "refusing duplicate send; details redacted",
+                job["id"],
+            )
+        else:
+            try:
+                # Outer failures used to bypass delivery entirely. Route them through
+                # the same dedicated failure lane as ordinary cron failures so an
+                # exception before normal final-response handling cannot leak into
+                # a job's success topic or disappear into logs only.
+                delivery_job = _job_for_cron_delivery(job, success=False)
+                deliver_content = _summarize_cron_failure_for_delivery(job, _err_text)
+                normalized_deliver = _normalize_deliver_value(
+                    delivery_job.get("deliver", "local")
+                )
+                if deliver_content.strip() and normalized_deliver != "local":
+                    failure_delivery_attempted = True
+                    failure_delivery_outcome = "attempted"
+                    delivery_error = _deliver_result(
+                        delivery_job,
+                        deliver_content,
+                        adapters=adapters,
+                        loop=loop,
+                    )
+                    failure_delivery_outcome = (
+                        "failed" if delivery_error else "delivered"
+                    )
+                    delivery_outcome = failure_delivery_outcome
+            except BaseException as delivery_exc:
+                delivery_error = (
+                    FAILURE_LANE_CONFIG_ERROR
+                    if isinstance(delivery_exc, CronFailureDeliveryConfigError)
+                    else "cron failure-delivery attempt failed; details redacted"
+                )
+                failure_delivery_outcome = "failed"
+                delivery_outcome = failure_delivery_outcome
+                logger.error(
+                    "Failure delivery failed for job %s; details redacted",
+                    job["id"],
+                )
+                if not isinstance(delivery_exc, Exception):
+                    delivery_interrupt = delivery_exc
         try:
             if not _consume_interrupted_flag(job["id"]):
-                mark_job_run(job["id"], False, _err_text)
+                mark_job_run(
+                    job["id"],
+                    False,
+                    _err_text,
+                    delivery_error=delivery_error,
+                )
         except Exception as record_err:
             # Never let bookkeeping mask the original interruption.
             logger.error(
@@ -4711,12 +4836,19 @@ def run_one_job(
                 job["id"], record_err,
             )
         try:
-            finish_execution(execution_id, success=False, error=_err_text)
+            finish_execution(
+                execution_id,
+                success=False,
+                error=_err_text,
+                delivery_outcome=delivery_outcome,
+            )
         except Exception as record_err:
             logger.error(
                 "Failed to finish execution record for job %s: %s",
                 job["id"], record_err,
             )
+        if delivery_interrupt is not None:
+            raise delivery_interrupt
         if not isinstance(e, Exception):
             raise
         return False
