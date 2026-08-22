@@ -3670,7 +3670,14 @@ class BasePlatformAdapter(ABC):
         self._topic_recovery_fn = fn  # type: ignore[attr-defined]
 
     def _apply_topic_recovery(self, event: MessageEvent) -> None:
-        """Rewrite ``event.source.thread_id`` in place if the hook returns one."""
+        """Rewrite topic routing and all topic-derived event metadata together.
+
+        Updating only ``thread_id`` leaves the original topic label, skill, and
+        channel prompt attached to the event.  Besides mislabelling the session,
+        that can apply a reserved lane's instructions after routing the reply to
+        a different lane.  Re-resolve those fields atomically from the recovered
+        destination before session keying and outbound metadata capture.
+        """
         recover = getattr(self, "_topic_recovery_fn", None)
         if recover is None:
             return
@@ -3685,7 +3692,43 @@ class BasePlatformAdapter(ABC):
         if recovered is None or str(recovered) == str(source.thread_id or ""):
             return
         try:
-            event.source = dataclasses.replace(source, thread_id=str(recovered))
+            recovered_id = str(recovered)
+            extra = getattr(getattr(self, "config", None), "extra", None) or {}
+            topic_name = None
+            topic_skills = None
+            dm_topics = extra.get("dm_topics") or []
+            if isinstance(dm_topics, list):
+                for entry in dm_topics:
+                    if not isinstance(entry, dict) or str(entry.get("chat_id") or "") != str(source.chat_id or ""):
+                        continue
+                    for topic in entry.get("topics") or []:
+                        if not isinstance(topic, dict) or str(topic.get("thread_id") or "") != recovered_id:
+                            continue
+                        raw_name = topic.get("name")
+                        topic_name = str(raw_name).strip() if raw_name else None
+                        raw_skills = topic.get("skills", topic.get("skill"))
+                        if isinstance(raw_skills, str) and raw_skills.strip():
+                            topic_skills = [raw_skills.strip()]
+                        elif isinstance(raw_skills, list):
+                            topic_skills = [str(item).strip() for item in raw_skills if str(item).strip()] or None
+                        break
+                    break
+
+            event.source = dataclasses.replace(
+                source,
+                thread_id=recovered_id,
+                chat_topic=topic_name,
+            )
+            event.auto_skill = topic_skills or resolve_channel_skills(
+                extra,
+                recovered_id,
+                str(source.chat_id or "") or None,
+            )
+            event.channel_prompt = resolve_channel_prompt(
+                extra,
+                recovered_id,
+                str(source.chat_id or "") or None,
+            )
         except Exception:
             logger.debug("topic recovery rewrite failed", exc_info=True)
 
