@@ -31,10 +31,6 @@ FAILURE_LANE_CONFIG_ERROR = (
 )
 
 
-class CronFailureDeliveryConfigError(RuntimeError):
-    """The global failure lane could not be read safely."""
-
-
 # Validates user-supplied delivery platform names, preventing env-var enumeration via crafted names.
 _KNOWN_DELIVERY_PLATFORMS = frozenset({
     "telegram", "discord", "slack", "whatsapp", "signal",
