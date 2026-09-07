@@ -118,3 +118,19 @@ async def test_hook_fires_without_session_store_attribute(monkeypatch):
     # Hook actually fired (skip short-circuited before auth) with a None store.
     assert seen == {"session_store": None}
     adapter.send.assert_not_awaited()
+
+
+def test_skip_wins_over_earlier_allow_result(monkeypatch):
+    """One plugin cannot allow a message that a later policy plugin rejects."""
+    def _fake_hook(name, **kwargs):
+        assert name == "pre_gateway_dispatch"
+        return [
+            {"action": "allow", "reason": "ordinary plugin"},
+            {"action": "skip", "reason": "reserved lane"},
+        ]
+
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", _fake_hook)
+    runner, _adapter = _make_runner(Platform.TELEGRAM)
+    event = _make_event(platform=Platform.TELEGRAM)
+
+    assert runner._hm_pre_gateway_dispatch_hook(event, event.source) is None

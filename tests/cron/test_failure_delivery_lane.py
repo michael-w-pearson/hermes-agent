@@ -1,88 +1,83 @@
-import pytest
-
-from cron import scheduler
+from cron import scheduler_delivery as delivery
 
 
-def test_success_keeps_normal_delivery(monkeypatch):
+ERROR_TARGET = "telegram:1221479515:36948"
+SUCCESS_TARGET = "telegram:1221479515:33169"
+
+
+def test_success_keeps_normal_delivery_without_reading_failure_config(monkeypatch):
+    def unexpected_config_read():
+        raise AssertionError("success routing must not read failure config")
+
+    monkeypatch.setattr(delivery._sched, "load_config", unexpected_config_read)
+    job = {"id": "brief", "deliver": SUCCESS_TARGET}
+
+    assert delivery._delivery_lane_value(job, for_failure=False) == SUCCESS_TARGET
+
+
+def test_explicit_failure_deliver_wins_without_reading_global_config(monkeypatch):
+    def unexpected_config_read():
+        raise AssertionError("explicit failure_deliver must win")
+
+    monkeypatch.setattr(delivery._sched, "load_config", unexpected_config_read)
+    job = {
+        "id": "brief",
+        "deliver": SUCCESS_TARGET,
+        "failure_deliver": "local",
+    }
+
+    assert delivery._delivery_lane_value(job, for_failure=True) == "local"
+
+
+def test_failure_uses_global_error_lane_when_job_has_no_override(monkeypatch):
     monkeypatch.setattr(
-        scheduler,
+        delivery._sched,
         "load_config",
-        lambda: {"cron": {"error_delivery_target": "telegram:1221479515:36948"}},
+        lambda: {"cron": {"error_delivery_target": ERROR_TARGET}},
     )
-    job = {"id": "brief", "deliver": "telegram:1221479515:33169"}
+    job = {"id": "brief", "deliver": SUCCESS_TARGET}
 
-    assert scheduler._job_for_cron_delivery(job, success=True) is job
-
-
-def test_failure_routes_to_dedicated_error_lane_without_mutating_job(monkeypatch):
-    monkeypatch.setattr(
-        scheduler,
-        "load_config",
-        lambda: {"cron": {"error_delivery_target": "telegram:1221479515:36948"}},
-    )
-    job = {"id": "brief", "deliver": "telegram:1221479515:33169"}
-
-    routed = scheduler._job_for_cron_delivery(job, success=False)
-
-    assert routed["deliver"] == "telegram:1221479515:36948"
-    assert job["deliver"] == "telegram:1221479515:33169"
+    assert delivery._delivery_lane_value(job, for_failure=True) == ERROR_TARGET
+    assert job == {"id": "brief", "deliver": SUCCESS_TARGET}
 
 
-def test_failure_keeps_normal_delivery_when_lane_is_unconfigured(monkeypatch):
-    monkeypatch.setattr(scheduler, "load_config", lambda: {})
+def test_failure_keeps_normal_delivery_when_global_lane_is_unconfigured(monkeypatch):
+    monkeypatch.setattr(delivery._sched, "load_config", lambda: {})
     job = {"id": "brief", "deliver": "origin"}
 
-    assert scheduler._job_for_cron_delivery(job, success=False) is job
+    assert delivery._delivery_lane_value(job, for_failure=True) == "origin"
 
 
-def test_failure_lane_config_read_error_blocks_success_destination(monkeypatch):
+def test_failure_lane_config_read_error_fails_closed_to_local(monkeypatch, caplog):
     def unreadable_config():
         raise ValueError("secret parser detail")
 
-    monkeypatch.setattr(scheduler, "load_config", unreadable_config)
-    job = {"id": "brief", "deliver": "telegram:1221479515:33169"}
+    monkeypatch.setattr(delivery._sched, "load_config", unreadable_config)
+    job = {"id": "brief", "deliver": SUCCESS_TARGET}
 
-    with pytest.raises(
-        scheduler.CronFailureDeliveryConfigError,
-        match=scheduler.FAILURE_LANE_CONFIG_ERROR,
-    ):
-        scheduler._job_for_cron_delivery(job, success=False)
+    with caplog.at_level("ERROR"):
+        lane = delivery._delivery_lane_value(job, for_failure=True)
 
-    assert job["deliver"] == "telegram:1221479515:33169"
+    assert lane == "local"
+    rendered_logs = "\n".join(record.getMessage() for record in caplog.records)
+    assert delivery.FAILURE_LANE_CONFIG_ERROR in rendered_logs
+    assert "secret parser detail" not in rendered_logs
+    assert job == {"id": "brief", "deliver": SUCCESS_TARGET}
 
 
-def test_outer_exception_delivers_to_dedicated_error_lane(monkeypatch):
+def test_failure_target_resolution_uses_global_error_lane(monkeypatch):
     monkeypatch.setattr(
-        scheduler,
+        delivery._sched,
         "load_config",
-        lambda: {"cron": {"error_delivery_target": "telegram:1221479515:36948"}},
+        lambda: {"cron": {"error_delivery_target": ERROR_TARGET}},
     )
-    monkeypatch.setattr(scheduler, "create_execution", lambda *args, **kwargs: {"id": "exec-1"})
-    monkeypatch.setattr(scheduler, "claim_dispatch", lambda *args, **kwargs: True)
-    monkeypatch.setattr(scheduler, "mark_execution_running", lambda *args, **kwargs: None)
-    monkeypatch.setattr(scheduler, "mark_job_run", lambda *args, **kwargs: None)
-    monkeypatch.setattr(scheduler, "finish_execution", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        scheduler,
-        "run_job",
-        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("provider exploded")),
-    )
-    delivered = []
-    monkeypatch.setattr(
-        scheduler,
-        "_deliver_result",
-        lambda job, content, **kwargs: delivered.append((job["deliver"], content)),
-    )
-    job = {
-        "id": "brief",
-        "name": "Morning Brief",
-        "deliver": "telegram:1221479515:33169",
-    }
+    job = {"id": "brief", "deliver": SUCCESS_TARGET}
 
-    assert scheduler.run_one_job(job) is False
-    assert delivered == [
-        (
-            "telegram:1221479515:36948",
-            "⚠️ Cron 'Morning Brief' failed: provider exploded",
-        )
+    assert delivery._resolve_delivery_targets(job, for_failure=True) == [
+        {
+            "platform": "telegram",
+            "chat_id": "1221479515",
+            "thread_id": "36948",
+            "_resolved_from": "explicit",
+        }
     ]

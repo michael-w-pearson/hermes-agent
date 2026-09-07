@@ -211,6 +211,34 @@ def test_session_stall_target_preserves_origin_without_valid_error_lane():
 
 
 @pytest.mark.asyncio
+async def test_session_stall_send_uses_error_lane():
+    adapter = _FakeAdapter()
+    runner = _runner_for_stall(adapter)
+    runner._read_user_config = lambda: {
+        "cron": {"error_delivery_target": "telegram:1221479515:36948"}
+    }
+    runner._thread_metadata_for_target = lambda platform, chat, thread, **kwargs: {
+        "thread_id": thread
+    }
+    session_key = "agent:main:telegram:dm:noticeboard-test"
+    event = SimpleNamespace(
+        text="follow-up",
+        source=SimpleNamespace(
+            chat_id="1221479515",
+            thread_id="26643",
+            platform=Platform.TELEGRAM,
+        ),
+        timestamp=time.time(),
+    )
+    adapter._pending_messages[session_key] = event
+    runner._running_agents[session_key] = _FakeAgent(time.time() - 120)
+
+    assert await runner._check_session_stalls(60) == 1
+    assert adapter.sent[0]["chat_id"] == "1221479515"
+    assert adapter.sent[0]["metadata"]["thread_id"] == "36948"
+
+
+@pytest.mark.asyncio
 async def test_check_session_stalls_notifies_once(monkeypatch):
     adapter = _FakeAdapter()
     runner = _runner_for_stall(adapter)
@@ -494,6 +522,18 @@ def test_resolve_idle_rejects_nonfinite_seconds_since_activity():
         now=now,
     )
     assert idle == 15.0
+
+
+def test_resolve_idle_rejects_boolean_seconds_and_uses_timestamp():
+    now = 1_000_000.0
+    idle = resolve_session_idle_seconds_from_activity(
+        {
+            "seconds_since_activity": True,
+            "last_activity_ts": now - 3,
+        },
+        now=now,
+    )
+    assert idle == 3.0
 
 
 def test_session_stall_timeout_in_default_config():
