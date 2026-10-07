@@ -1066,14 +1066,14 @@ def _expand_routing_tokens(part: str) -> List[str]:
 
 
 def _delivery_lane_value(job: dict, *, for_failure: bool = False):
-    """Raw deliver-lane value for a run outcome: the failure lane when ``for_failure`` and the job
-    overrides it, else ``deliver``. Bookkeeping (outcome classification, unresolved-origin, incident
-    'alerted' marking) must read the SAME lane the notice was routed through (NS-788)."""
+    """Raw deliver-lane value for a run outcome: for a failure, the job's ``failure_deliver``, else
+    the global ``cron.error_delivery_target``, else ``deliver``. Bookkeeping (outcome, unresolved-origin,
+    incident 'alerted' marking) must read the SAME lane the notice was routed through (NS-788)."""
     if for_failure:
         failure_deliver = job.get("failure_deliver")
         if failure_deliver is not None and str(failure_deliver).strip():
             return failure_deliver
-    return job.get("deliver", "local")
+    return (for_failure and _failure_lane.global_failure_target()) or job.get("deliver", "local")
 
 
 def _resolve_delivery_targets(job: dict, *, for_failure: bool = False) -> List[dict]:
@@ -1081,7 +1081,7 @@ def _resolve_delivery_targets(job: dict, *, for_failure: bool = False) -> List[d
     platform with a home channel and combines with explicit targets. Dedup by (platform, chat_id,
     thread_id). ``for_failure=True`` (failure summaries, interrupted-run notices, drift/preflight
     alerts) resolves from ``failure_deliver`` INSTEAD when the job carries one —
-    ``failure_deliver: local`` is the structural opt-out; absent, failures follow ``deliver``."""
+    ``failure_deliver: local`` is the structural opt-out; absent, see ``_delivery_lane_value``."""
     deliver = _normalize_deliver_value(_delivery_lane_value(job, for_failure=for_failure))
     if deliver == "local":
         return []
@@ -2126,6 +2126,6 @@ def _deliver_result(
 # Late-bound origin namespace (see module docstring). Imported LAST so this module is fully
 # populated before ``scheduler`` re-exports from it.
 from cron import scheduler as _sched  # noqa: E402
-from cron import scheduler_delivery_origin as _origin  # noqa: E402
+from cron import scheduler_delivery_origin as _origin, scheduler_failure_lane as _failure_lane  # noqa: E402
 from cron import scheduler_preflight as _preflight  # noqa: E402
 from cron import scheduler_script as _script  # noqa: E402

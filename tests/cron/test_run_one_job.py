@@ -13,6 +13,8 @@ extracted helper directly.
 import pytest
 
 import cron.scheduler as s
+from cron import scheduler_delivery as delivery
+from cron.scheduler_failure_lane import FAILURE_LANE_CONFIG_ERROR
 
 
 def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final response",
@@ -195,6 +197,76 @@ def test_run_one_job_exception_records_failure_alert_delivery_error(monkeypatch)
     assert marked == [
         (("j4", False, "provider failed"), {"delivery_error": "send failed: 502"})
     ]
+
+
+def test_unreadable_failure_lane_stays_local_and_finishes_bookkeeping(monkeypatch, caplog):
+    """A broken global failure-lane config must not leak or wedge the run ledger."""
+    marked = []
+    finished = []
+    deliveries = []
+
+    monkeypatch.setattr(s, "create_execution", lambda *_a, **_kw: {"id": "exec-j-config"})
+    monkeypatch.setattr(s, "claim_dispatch", lambda _job_id: True)
+    monkeypatch.setattr(s, "mark_execution_running", lambda _execution_id: {})
+    monkeypatch.setattr(
+        s,
+        "run_job",
+        lambda *_a, **_kw: (False, "out", "", "provider failed"),
+    )
+    monkeypatch.setattr(s, "save_job_output", lambda *_a, **_kw: "/tmp/out.txt")
+    monkeypatch.setattr(
+        s,
+        "_compose_run_delivery",
+        lambda *_a, **_kw: ("failure notice", False, False, False, None),
+    )
+    monkeypatch.setattr(
+        s,
+        "_deliver_result",
+        lambda job, _content, **kwargs: deliveries.append(
+            s._delivery_lane_value(
+                job, for_failure=bool(kwargs.get("for_failure"))
+            )
+        ) or None,
+    )
+    monkeypatch.setattr(
+        s,
+        "mark_job_run",
+        lambda *args, **kwargs: marked.append((args, kwargs)) or True,
+    )
+    monkeypatch.setattr(
+        s,
+        "finish_execution",
+        lambda *args, **kwargs: finished.append((args, kwargs)),
+    )
+
+    def unreadable_config():
+        raise ValueError("PRIVATE-PARSER-SENTINEL")
+
+    monkeypatch.setattr(s, "load_config", unreadable_config)
+
+    with caplog.at_level("ERROR"):
+        ok = s.run_one_job(
+            {"id": "j-config", "name": "broken-config", "deliver": "telegram:success"}
+        )
+
+    assert ok is True
+    assert deliveries == ["local"]
+    assert marked == [
+        (("j-config", False, "provider failed"), {"delivery_error": None})
+    ]
+    assert finished == [
+        (
+            ("exec-j-config",),
+            {
+                "success": False,
+                "error": "provider failed",
+                "delivery_outcome": "suppressed",
+            },
+        )
+    ]
+    rendered_logs = "\n".join(record.getMessage() for record in caplog.records)
+    assert "PRIVATE-PARSER-SENTINEL" not in rendered_logs
+    assert FAILURE_LANE_CONFIG_ERROR in rendered_logs
 
 
 def _patch_escaped_failure(monkeypatch, delivered, *, exec_id, err):
