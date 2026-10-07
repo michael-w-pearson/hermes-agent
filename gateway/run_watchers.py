@@ -79,6 +79,37 @@ class GatewaySessionWatchersMixin:
         from gateway.run import _float_env
         return _float_env("HERMES_SESSION_STALL_TIMEOUT", 300)
 
+    def _session_stall_notification_target(self, source, adapter):
+        """Route Telegram stall notices to ``cron.error_delivery_target`` when it names a Telegram
+        ``telegram:<chat_id>:<thread_id>`` lane; otherwise keep the session's own chat and thread."""
+        from gateway.config import Platform
+
+        chat_id = getattr(source, "chat_id", None)
+        metadata = self._thread_metadata_for_source(source)
+        if getattr(source, "platform", None) != Platform.TELEGRAM:
+            return chat_id, metadata
+        try:
+            cfg = self._read_user_config() or {}
+            target = str(
+                ((cfg.get("cron") or {}).get("error_delivery_target") or "")
+            ).strip()
+        except Exception:
+            logger.debug("Failed to read session stall error lane", exc_info=True)
+            return chat_id, metadata
+        parts = target.split(":", 2)
+        if len(parts) != 3 or parts[0] != "telegram" or not parts[1] or not parts[2]:
+            return chat_id, metadata
+        target_chat_id, target_thread_id = parts[1], parts[2]
+        target_metadata = self._thread_metadata_for_target(
+            Platform.TELEGRAM,
+            target_chat_id,
+            target_thread_id,
+            # Telegram private-chat ids are positive; group and channel ids are negative.
+            chat_type=None if target_chat_id.startswith("-") else "dm",
+            adapter=adapter,
+        )
+        return target_chat_id, target_metadata
+
     def _session_activity_for_stall(self, session_key: str) -> Optional[dict]:
         """Stall-progress snapshot from ``AIAgent.get_activity_summary()`` only; no other clocks.
 
@@ -180,7 +211,7 @@ class GatewaySessionWatchersMixin:
         from gateway.warning_notifications import present_notification
         from gateway.run import _async_profile_runtime_scope
         try:
-            metadata = self._thread_metadata_for_source(source)
+            target_chat_id, metadata = self._session_stall_notification_target(source, adapter)
             notice = format_session_stall_notification(idle_seconds)
             result = None
             async def send_notice():
@@ -188,7 +219,7 @@ class GatewaySessionWatchersMixin:
                 # Bound the send: a wedged adapter transport (network hang, dead websocket) must not
                 # block the watcher pass — siblings would go unevaluated and the watcher stop.
                 result = await asyncio.wait_for(
-                    adapter.send(str(source.chat_id), notice, metadata=metadata),
+                    adapter.send(str(target_chat_id), notice, metadata=metadata),
                     timeout=_STALL_NOTIFY_SEND_TIMEOUT_SECONDS,
                 )
             async with _async_profile_runtime_scope(self._resolve_profile_home_for_source(source)):

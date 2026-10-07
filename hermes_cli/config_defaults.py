@@ -1799,6 +1799,9 @@ DEFAULT_CONFIG = {
 
     "cron": {
         "catch_up_missed": True,  # False skips recurring misses beyond the local grace window.
+        # Default failure-notice target for jobs without failure_deliver (same grammar as
+        # deliver). "" = failures follow deliver. An unreadable config fails closed to local.
+        "error_delivery_target": "",
         # Let cron-spawned agents use the cronjob toolset (the "cron-librarian" pattern). Off by
         # default: policy-denied in cron context to prevent unattended scheduling loops. Jobs
         # created this way are user-owned in the same flat jobs table. Interactive toolsets

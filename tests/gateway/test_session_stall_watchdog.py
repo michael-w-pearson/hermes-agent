@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent.session_activity import ActivityProvenance, build_activity_snapshot
+from gateway.config import Platform
 from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL
 from gateway.session_stall import (
     resolve_session_idle_seconds_from_activity,
@@ -162,6 +163,82 @@ def _pending_event(chat_id: str = "chat-1", thread_id: str | None = None):
     from gateway.config import Platform
     source = SessionSource(chat_id=chat_id, thread_id=thread_id, platform=Platform.TELEGRAM)
     return SimpleNamespace(text="follow-up", source=source, timestamp=time.time())
+
+
+@pytest.mark.parametrize(
+    "target_chat, chat_type", [("123456789", "dm"), ("-100123456789", None)]
+)
+def test_session_stall_target_routes_telegram_to_error_lane(target_chat, chat_type):
+    adapter = _FakeAdapter()
+    runner = _runner_for_stall(adapter)
+    runner._read_user_config = lambda: {
+        "cron": {"error_delivery_target": f"telegram:{target_chat}:200"}
+    }
+    seen = {}
+
+    def _target_metadata(platform, chat, thread, **kwargs):
+        seen.update(kwargs)
+        return {"thread_id": thread, "direct_messages_topic_id": thread}
+
+    runner._thread_metadata_for_target = _target_metadata
+    source = SimpleNamespace(
+        chat_id="123456789",
+        thread_id="300",
+        platform=Platform.TELEGRAM,
+    )
+
+    chat_id, metadata = runner._session_stall_notification_target(source, adapter)
+
+    assert chat_id == target_chat
+    assert seen["chat_type"] == chat_type
+    assert metadata["thread_id"] == "200"
+    assert metadata["direct_messages_topic_id"] == "200"
+
+
+def test_session_stall_target_preserves_origin_without_valid_error_lane():
+    adapter = _FakeAdapter()
+    runner = _runner_for_stall(adapter)
+    runner._read_user_config = lambda: {
+        "cron": {"error_delivery_target": "telegram"}
+    }
+    source = SimpleNamespace(
+        chat_id="123456789",
+        thread_id="300",
+        platform=Platform.TELEGRAM,
+    )
+
+    chat_id, metadata = runner._session_stall_notification_target(source, adapter)
+
+    assert chat_id == "123456789"
+    assert metadata["thread_id"] == "300"
+
+
+@pytest.mark.asyncio
+async def test_session_stall_send_uses_error_lane():
+    adapter = _FakeAdapter()
+    runner = _runner_for_stall(adapter)
+    runner._read_user_config = lambda: {
+        "cron": {"error_delivery_target": "telegram:123456789:200"}
+    }
+    runner._thread_metadata_for_target = lambda platform, chat, thread, **kwargs: {
+        "thread_id": thread
+    }
+    session_key = "agent:main:telegram:dm:stall-test"
+    event = SimpleNamespace(
+        text="follow-up",
+        source=SimpleNamespace(
+            chat_id="123456789",
+            thread_id="300",
+            platform=Platform.TELEGRAM,
+        ),
+        timestamp=time.time(),
+    )
+    adapter._pending_messages[session_key] = event
+    runner._running_agents[session_key] = _FakeAgent(time.time() - 120)
+
+    assert await runner._check_session_stalls(60) == 1
+    assert adapter.sent[0]["chat_id"] == "123456789"
+    assert adapter.sent[0]["metadata"]["thread_id"] == "200"
 
 
 @pytest.mark.asyncio
