@@ -18,6 +18,7 @@ import { runPython } from '../../../scripts/build/python.mjs'
 
 import { assertPackagedBackendReadyArtifact, resolvePackagedAsarPath } from './backend-ready-artifact.mjs'
 import { batchSignAppTree } from './batch-sign-binaries.mjs'
+import { assertPackagedPayload, preparedPayloadSource } from './packaged-payload.mjs'
 import { rehashPayloadDigests } from './payload-digests.mjs'
 import { resolveSigningIdentity, signNestedChromium } from './sign-nested-chromium.mjs'
 import { signWheelZipMembers } from './sign-wheel-zips.mjs'
@@ -73,6 +74,17 @@ export default async function afterPack(context) {
     ? path.join(context.appOutDir, `${context.packager.appInfo.productFilename}.app`, 'Contents', 'Resources')
     : path.join(context.appOutDir, 'resources')
   const payload = path.join(resources, 'agent-payload')
+  const prepared = preparedPayloadSource(context.packager)
+  // Check the copy before relocation, framework repairs and signing change it on purpose.
+  if (prepared) {
+    assertPackagedPayload(prepared, payload)
+    console.log(`[after-pack] packaged payload matches the prepared payload ${prepared}`)
+  }
+  await packPlatform(context, payload)
+}
+
+async function packPlatform(context, payload) {
+  const platform = context.electronPlatformName
   if (platform !== 'win32' && fs.existsSync(path.join(payload, 'manifest.json'))) {
     runPython([
       path.resolve(import.meta.dirname, '../../../scripts/bundles/payload.py'), 'relocate', payload], { stdio: 'inherit' })
@@ -118,6 +130,7 @@ export default async function afterPack(context) {
   // one bad payload DLL fails the whole package. Unlike the stamp below this
   // is NOT best-effort: shipping past it means shipping an unsignable bundle.
   // this is a hack until https://github.com/astral-sh/python-build-standalone/pull/1217 is merged.
+  console.log(`[after-pack] scanning PE certificate headers in ${context.appOutDir}`)
   const { scanned, repaired } = sanitizeTree(context.appOutDir)
   console.log(`[after-pack] ${scanned} PEs scanned, ${repaired.length} dangling certificate tables cleared`)
   for (const file of repaired) {

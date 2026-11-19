@@ -31,6 +31,8 @@ export interface ChatBarState {
     /** False when the catalog says the active model has no reasoning control;
      *  undefined while unknown (loading) so the pill stays put. */
     supportsReasoning?: boolean
+    supportsFast?: boolean
+    supportsUltrafast?: boolean
   }
   tools: { enabled: boolean; label: string; suggestions?: ContextSuggestion[] }
   voice: { enabled: boolean; active: boolean }
@@ -61,7 +63,7 @@ export interface ChatBarProps {
   onPickFolders?: () => void
   onPickImages?: () => void
   onRemoveAttachment?: (id: string) => void
-  onSteer?: (text: string) => Promise<boolean> | boolean
+  onSteer?: (text: string, mode?: 'interrupt' | 'steer') => Promise<boolean> | boolean
   /** Delivers a hidden note to the model mid-turn with no user turn (gateway session.steer). */
   onSteerHidden?: (text: string) => Promise<boolean> | boolean
   onSubmit: (value: string, options?: SubmitTextOptions) => Promise<boolean> | boolean
@@ -73,5 +75,7 @@ export type VoiceStatus = 'idle' | 'recording' | 'transcribing'
 export interface VoiceActivityState {
   elapsedSeconds: number
   level: number
+  /** Live STT text so far (stt.streaming); '' when none. */
+  partial?: string
   status: VoiceStatus
 }

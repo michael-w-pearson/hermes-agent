@@ -42,7 +42,7 @@ def test_failure_uses_global_error_lane_when_job_has_no_override(monkeypatch):
 
 
 def test_failure_keeps_normal_delivery_when_global_lane_is_unconfigured(monkeypatch):
-    monkeypatch.setattr(delivery._sched, "load_config", lambda: {})
+    monkeypatch.setattr(delivery._sched, "load_config", dict)
     job = {"id": "brief", "deliver": "origin"}
 
     assert delivery._delivery_lane_value(job, for_failure=True) == "origin"

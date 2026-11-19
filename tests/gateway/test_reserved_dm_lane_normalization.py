@@ -5,9 +5,11 @@ outbound metadata capture.  Scheduled reports and incident deliveries use
 explicit destinations and do not pass through this inbound normalization.
 """
 
+from contextlib import contextmanager
 from types import SimpleNamespace
 
-from hermes_state import SessionDB
+
+from persistence_assembly import open_persistence, profile_scope
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.session import SessionSource
@@ -54,15 +56,16 @@ def _source(thread_id: str, *, chat_id: str = CHAT_ID, topic: str | None = None)
     )
 
 
+@contextmanager
 def _runner(tmp_path, *, extra=None):
     from gateway.run import GatewayRunner
 
-    db = SessionDB(db_path=tmp_path / "state.db")
-    db.enable_telegram_topic_mode(chat_id=CHAT_ID, user_id=CHAT_ID)
-    db.enable_telegram_topic_mode(chat_id="999", user_id="999")
+    db = open_persistence(profile_scope(home=tmp_path))
+    db.routing.enable_topic_mode(chat_id=CHAT_ID, user_id=CHAT_ID)
+    db.routing.enable_topic_mode(chat_id="999", user_id="999")
 
     runner = object.__new__(GatewayRunner)
-    runner._session_db = db
+    runner.session_store = SimpleNamespace(persistence=db)
     runner.config = GatewayConfig(
         platforms={
             Platform.TELEGRAM: PlatformConfig(
@@ -72,44 +75,47 @@ def _runner(tmp_path, *, extra=None):
             )
         }
     )
-    return runner
+    try:
+        yield runner
+    finally:
+        db.close()
 
 
 def test_noticeboard_human_message_recovers_to_agora_before_keying(tmp_path):
-    runner = _runner(tmp_path)
-    assert runner._recover_telegram_topic_thread_id(
-        _source(NOTICEBOARD_ID, topic="The Noticeboard")
-    ) == AGORA_ID
+    with _runner(tmp_path) as runner:
+        assert runner._recover_telegram_topic_thread_id(
+            _source(NOTICEBOARD_ID, topic="The Noticeboard")
+        ) == AGORA_ID
 
 
 def test_herald_human_message_recovers_to_agora_before_keying(tmp_path):
-    runner = _runner(tmp_path)
-    assert runner._recover_telegram_topic_thread_id(
-        _source(HERALD_ID, topic="The Herald's Desk")
-    ) == AGORA_ID
+    with _runner(tmp_path) as runner:
+        assert runner._recover_telegram_topic_thread_id(
+            _source(HERALD_ID, topic="The Herald's Desk")
+        ) == AGORA_ID
 
 
 def test_agora_message_is_not_rewritten(tmp_path):
-    runner = _runner(tmp_path)
-    assert runner._recover_telegram_topic_thread_id(
-        _source(AGORA_ID, topic="The Agora")
-    ) is None
+    with _runner(tmp_path) as runner:
+        assert runner._recover_telegram_topic_thread_id(
+            _source(AGORA_ID, topic="The Agora")
+        ) is None
 
 
 def test_reserved_policy_is_scoped_to_the_configured_chat(tmp_path):
-    runner = _runner(tmp_path)
-    assert runner._recover_telegram_topic_thread_id(
-        _source(NOTICEBOARD_ID, chat_id="999", topic="The Noticeboard")
-    ) is None
+    with _runner(tmp_path) as runner:
+        assert runner._recover_telegram_topic_thread_id(
+            _source(NOTICEBOARD_ID, chat_id="999", topic="The Noticeboard")
+        ) is None
 
 
 def test_missing_reserved_policy_preserves_normal_topic_behavior(tmp_path):
     extra = _extra()
     extra.pop("dm_topic_policy")
-    runner = _runner(tmp_path, extra=extra)
-    assert runner._recover_telegram_topic_thread_id(
-        _source(NOTICEBOARD_ID, topic="The Noticeboard")
-    ) is None
+    with _runner(tmp_path, extra=extra) as runner:
+        assert runner._recover_telegram_topic_thread_id(
+            _source(NOTICEBOARD_ID, topic="The Noticeboard")
+        ) is None
 
 
 def test_adapter_recovery_updates_topic_label_and_prompt():
