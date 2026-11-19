@@ -9,12 +9,11 @@ import type {
 } from '@/types/hermes'
 import type { ActionResponse } from '@/types/hermes'
 
-import { capabilityScoped, hermesApi, type ProfileScope, profileScoped, scopedDialPriority } from './client'
+import { capabilityScoped, hermesApi, type ProfileScope, profileScoped } from './client'
 
 export function getSkills(profile?: ProfileScope): Promise<SkillInfo[]> {
   return window.hermesDesktop.api<SkillInfo[]>({
     ...capabilityScoped(profile),
-    ...scopedDialPriority(profile),
     path: '/api/skills'
   })
 }
@@ -41,6 +40,20 @@ export function setSkillEnabled(
     path: '/api/skills/toggle',
     method: 'PUT',
     body: { name, enabled }
+  })
+}
+
+/** Lock/unlock a skill against AGENT edits (`hermes curator lock`); the user's own edits stay allowed. */
+export function setSkillLocked(
+  name: string,
+  locked: boolean,
+  profile?: ProfileScope
+): Promise<{ ok: boolean; name: string; locked: boolean }> {
+  return window.hermesDesktop.api<{ ok: boolean; name: string; locked: boolean }>({
+    ...capabilityScoped(profile),
+    path: '/api/skills/lock',
+    method: 'PUT',
+    body: { name, locked }
   })
 }
 
@@ -104,6 +117,21 @@ export function getOfficialSkills(profile?: ProfileScope): Promise<{ skills: Off
   return window.hermesDesktop.api<{ skills: OfficialSkillInfo[] }>({
     ...capabilityScoped(profile),
     path: '/api/skills/hub/official'
+  })
+}
+
+export interface SkillHubUpdate {
+  name: string
+  identifier: string
+  source: string
+}
+
+/** Hub skills with a newer upstream version (`hermes skills check`). Slow: fetches every source. */
+export function getSkillHubUpdates(profile?: ProfileScope): Promise<{ updates: SkillHubUpdate[] }> {
+  return window.hermesDesktop.api<{ updates: SkillHubUpdate[] }>({
+    ...capabilityScoped(profile),
+    path: '/api/skills/hub/updates',
+    timeoutMs: 120_000
   })
 }
 
